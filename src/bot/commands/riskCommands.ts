@@ -10,12 +10,13 @@ const VALID_RISK_KEYS: Array<keyof RiskConfig> = [
   'max_open_positions',
   'max_order_value',
   'trading_enabled',
+  'virtual_trading',
 ];
 
 export async function handleViewRisk(ctx: Context): Promise<void> {
   try {
     const report = await riskManager.formatStatusReport();
-    await ctx.reply(report, { parse_mode: 'Markdown' });
+    await ctx.reply(report, { parse_mode: 'HTML' });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     await ctx.reply(`❌ Failed to fetch risk status: ${msg}`);
@@ -31,14 +32,15 @@ export async function handleSetRisk(ctx: Context): Promise<void> {
 
   if (parts.length < 2) {
     await ctx.reply(
-      '📝 *Usage:* `/set_risk <key> <value>`\n\n' +
-      '*Available keys:*\n' +
-      `• \`max_daily_loss\` — e.g., \`5000\`\n` +
-      `• \`max_open_positions\` — e.g., \`3\`\n` +
-      `• \`max_order_value\` — e.g., \`100000\`\n` +
-      `• \`trading_enabled\` — \`true\` or \`false\`\n\n` +
-      '*Example:* `/set_risk max_daily_loss 7500`',
-      { parse_mode: 'Markdown' },
+      '📝 <b>Usage:</b> <code>/set_risk &lt;key&gt; &lt;value&gt;</code>\n\n' +
+      '<b>Available keys:</b>\n' +
+      `• <code>virtual_trading</code> — <code>true</code> (paper) or <code>false</code> (live)\n` +
+      `• <code>max_daily_loss</code> — e.g. <code>5000</code>\n` +
+      `• <code>max_open_positions</code> — e.g. <code>3</code>\n` +
+      `• <code>max_order_value</code> — e.g. <code>100000</code>\n` +
+      `• <code>trading_enabled</code> — <code>true</code> or <code>false</code>\n\n` +
+      '<b>Example:</b> <code>/set_risk virtual_trading true</code>',
+      { parse_mode: 'HTML' },
     );
     return;
   }
@@ -51,9 +53,9 @@ export async function handleSetRisk(ctx: Context): Promise<void> {
 
   if (!VALID_RISK_KEYS.includes(key as keyof RiskConfig)) {
     await ctx.reply(
-      `❌ Unknown risk key: \`${key}\`\n\n` +
-      `Valid keys: ${VALID_RISK_KEYS.map((k) => `\`${k}\``).join(', ')}`,
-      { parse_mode: 'Markdown' },
+      `❌ Unknown risk key: <code>${key}</code>\n\n` +
+      `Valid keys: ${VALID_RISK_KEYS.map((k) => `<code>${k}</code>`).join(', ')}`,
+      { parse_mode: 'HTML' },
     );
     return;
   }
@@ -61,16 +63,16 @@ export async function handleSetRisk(ctx: Context): Promise<void> {
   const riskKey = key as keyof RiskConfig;
   let parsedValue: number | boolean;
 
-  if (riskKey === 'trading_enabled') {
-    if (rawValue !== 'true' && rawValue !== 'false') {
-      await ctx.reply('❌ `trading_enabled` must be `true` or `false`.', { parse_mode: 'Markdown' });
+  if (riskKey === 'trading_enabled' || riskKey === 'virtual_trading') {
+    if (rawValue.toLowerCase() !== 'true' && rawValue.toLowerCase() !== 'false') {
+      await ctx.reply(`❌ <code>${riskKey}</code> must be <code>true</code> or <code>false</code>.`, { parse_mode: 'HTML' });
       return;
     }
-    parsedValue = rawValue === 'true';
+    parsedValue = rawValue.toLowerCase() === 'true';
   } else {
     parsedValue = parseFloat(rawValue);
     if (isNaN(parsedValue) || parsedValue < 0) {
-      await ctx.reply(`❌ Value must be a positive number. Got: \`${rawValue}\``, { parse_mode: 'Markdown' });
+      await ctx.reply(`❌ Value must be a positive number. Got: <code>${rawValue}</code>`, { parse_mode: 'HTML' });
       return;
     }
   }
@@ -78,9 +80,9 @@ export async function handleSetRisk(ctx: Context): Promise<void> {
   try {
     riskManager.updateConfig(riskKey, parsedValue);
     await ctx.reply(
-      `✅ *Risk Setting Updated*\n\n` +
-      `\`${riskKey}\` → \`${parsedValue}\``,
-      { parse_mode: 'Markdown' },
+      `✅ <b>Risk Setting Updated</b>\n\n` +
+      `<code>${riskKey}</code> ➔ <b>${parsedValue}</b>`,
+      { parse_mode: 'HTML' },
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

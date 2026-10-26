@@ -2,5 +2,6 @@
   "max_daily_loss": 5000,
   "max_open_positions": 3,
   "max_order_value": 100000,
-  "trading_enabled": true
+  "trading_enabled": true,
+  "virtual_trading": true
 }

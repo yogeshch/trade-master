@@ -3,6 +3,8 @@
 // Validates proposed orders against configured risk limits.
 // ============================================================
 import { KiteConnect } from 'kiteconnect';
+import { getKiteInstance } from '../auth/authServer';
+import { getAccessToken } from '../auth/sessionManager';
 import type { RiskConfig, TradingSignal, RiskCheckResult } from '../types';
 import { readConfig, writeConfig } from '../storage/storage';
 
@@ -13,6 +15,17 @@ class RiskManager {
 
   setKite(kite: KiteConnect): void {
     this.kite = kite;
+  }
+
+  private ensureKite(): KiteConnect {
+    if (!this.kite) {
+      this.kite = getKiteInstance();
+    }
+    const token = getAccessToken();
+    if (token && this.kite.access_token !== token) {
+      this.kite.setAccessToken(token);
+    }
+    return this.kite;
   }
 
   /** Read the current risk config from disk. */
@@ -32,14 +45,25 @@ class RiskManager {
     this.updateConfig('trading_enabled', enabled);
   }
 
+  /** Check if Virtual Trading (Paper Trading) mode is active. */
+  isVirtualTrading(): boolean {
+    const cfg = this.getConfig();
+    return cfg.virtual_trading ?? true; // Defaults to true for safety
+  }
+
+  /** Set Virtual Trading mode. */
+  setVirtualTrading(enabled: boolean): void {
+    this.updateConfig('virtual_trading', enabled);
+  }
+
   /**
    * Fetch current day's open positions count.
    * Returns 0 if kite instance is unavailable.
    */
   async getOpenPositionCount(): Promise<number> {
-    if (!this.kite) return 0;
     try {
-      const positions = await this.kite.getPositions();
+      const kite = this.ensureKite();
+      const positions = await kite.getPositions();
       const net = (positions.net ?? []) as Array<{ quantity: number }>;
       return net.filter((p) => p.quantity !== 0).length;
     } catch {
@@ -51,9 +75,9 @@ class RiskManager {
    * Fetch today's realized + unrealized PnL.
    */
   async getTodayPnL(): Promise<{ realized: number; unrealized: number; total: number }> {
-    if (!this.kite) return { realized: 0, unrealized: 0, total: 0 };
     try {
-      const positions = await this.kite.getPositions();
+      const kite = this.ensureKite();
+      const positions = await kite.getPositions();
       const day = (positions.day ?? []) as Array<{ realised: number; unrealised: number }>;
       const realized = day.reduce((acc, p) => acc + (p.realised ?? 0), 0);
       const unrealized = day.reduce((acc, p) => acc + (p.unrealised ?? 0), 0);
@@ -114,19 +138,21 @@ class RiskManager {
     const pnl = await this.getTodayPnL();
     const positions = await this.getOpenPositionCount();
 
+    const modeText = (cfg.virtual_trading ?? true) ? '🟡 VIRTUAL (Paper Trading)' : '🟢 LIVE (Real Capital)';
     const status = cfg.trading_enabled ? '🟢 Active' : '🔴 Disabled (Kill Switch)';
     const pnlEmoji = pnl.total >= 0 ? '🟢' : '🔴';
 
     return (
-      `📊 *Risk Management Status*\n` +
+      `📊 <b>Risk Management Status</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
+      `Mode: <b>${modeText}</b>\n` +
       `Trading: ${status}\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `📉 Max Daily Loss: ₹${cfg.max_daily_loss.toLocaleString()}\n` +
       `📦 Max Open Positions: ${cfg.max_open_positions}\n` +
       `💰 Max Order Value: ₹${cfg.max_order_value.toLocaleString()}\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
-      `${pnlEmoji} Today's P&L: ₹${pnl.total.toFixed(2)}\n` +
+      `${pnlEmoji} Today's P&amp;L: ₹${pnl.total.toFixed(2)}\n` +
       `  Realized: ₹${pnl.realized.toFixed(2)}\n` +
       `  Unrealized: ₹${pnl.unrealized.toFixed(2)}\n` +
       `📊 Open Positions: ${positions}/${cfg.max_open_positions}`

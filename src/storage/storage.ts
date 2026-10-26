@@ -8,12 +8,19 @@ const CONFIG_DIR = path.resolve(__dirname, '../../config');
 
 /**
  * Atomically reads a JSON file from the config directory.
- * Throws if the file does not exist or is malformed.
+ * If file does not exist and defaultValue is provided, returns defaultValue.
  */
-export function readConfig<T>(filename: string): T {
+export function readConfig<T>(filename: string, defaultValue?: T): T {
   const filePath = path.join(CONFIG_DIR, filename);
-  const raw = fs.readFileSync(filePath, 'utf-8');
-  return JSON.parse(raw) as T;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    if (defaultValue !== undefined) {
+      return defaultValue;
+    }
+    throw err;
+  }
 }
 
 /**

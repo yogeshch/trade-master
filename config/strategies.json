@@ -1,3 +1,24 @@
 {
-  "rules": []
+  "rules": [
+    {
+      "id": "MU71V1",
+      "type": "COMPOSITE",
+      "symbol": "HDFCBANK",
+      "exchange": "NSE",
+      "timeframe": "5m",
+      "fastEMA": 20,
+      "slowEMA": 50,
+      "rsiPeriod": 14,
+      "rsiMin": 30,
+      "rsiMax": 70,
+      "volumeCondition": "GREATER_THAN_PREVIOUS",
+      "action": "BUY",
+      "qty": 10,
+      "product": "MIS",
+      "stop_loss_pct": 2,
+      "target_pct": 5,
+      "enabled": true,
+      "createdAt": "2026-10-26T05:50:32.666Z"
+    }
+  ]
 }

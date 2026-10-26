@@ -6,22 +6,37 @@ import { readSession } from '../storage/storage';
 import { getKiteInstance, setAccessToken } from './authServer';
 
 /**
- * Returns true if the persisted session was created today (IST).
+ * Returns true if the persisted session was created during the current trading session.
+ * Zerodha access tokens expire daily at 7:30 AM IST (02:00 AM UTC).
  */
-function isSessionFresh(loginTime: string): boolean {
+export function isSessionFresh(loginTime: string): boolean {
+  if (!loginTime) return false;
   const loginDate = new Date(loginTime);
   const now = new Date();
+  const diffMs = now.getTime() - loginDate.getTime();
 
-  // Compare date strings in IST (UTC+5:30)
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const loginIST = new Date(loginDate.getTime() + istOffset);
-  const nowIST = new Date(now.getTime() + istOffset);
+  // If timestamp is invalid or older than 24 hours, stale
+  if (isNaN(loginDate.getTime()) || diffMs < -60000 || diffMs > 24 * 60 * 60 * 1000) {
+    return false;
+  }
 
-  return (
-    loginIST.getUTCFullYear() === nowIST.getUTCFullYear() &&
-    loginIST.getUTCMonth() === nowIST.getUTCMonth() &&
-    loginIST.getUTCDate() === nowIST.getUTCDate()
-  );
+  // Zerodha tokens reset daily at 07:30 AM IST (02:00 UTC).
+  // Determine the most recent 7:30 AM IST cutoff:
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  const nowIST = new Date(now.getTime() + istOffsetMs);
+
+  const todayCutoffIST = new Date(nowIST);
+  todayCutoffIST.setUTCHours(7, 30, 0, 0);
+
+  let lastResetIST: Date;
+  if (nowIST.getTime() >= todayCutoffIST.getTime()) {
+    lastResetIST = todayCutoffIST;
+  } else {
+    lastResetIST = new Date(todayCutoffIST.getTime() - 24 * 60 * 60 * 1000);
+  }
+
+  const loginIST = new Date(loginDate.getTime() + istOffsetMs);
+  return loginIST.getTime() >= lastResetIST.getTime();
 }
 
 /**
@@ -37,7 +52,7 @@ export function restoreSession(): boolean {
   }
 
   if (!isSessionFresh(session.login_time)) {
-    console.log('[Session] Session is stale (from a previous day). Please re-authenticate.');
+    console.log('[Session] Session is stale. Please re-authenticate via /login.');
     return false;
   }
 
@@ -47,8 +62,7 @@ export function restoreSession(): boolean {
 }
 
 /**
- * Check if the kite instance currently has an access token set.
- * (Lightweight liveness check - does not make an API call.)
+ * Check if the session is currently authenticated and fresh.
  */
 export function isAuthenticated(): boolean {
   const session = readSession();

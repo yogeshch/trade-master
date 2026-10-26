@@ -1,9 +1,15 @@
 // ============================================================
 // Trade Master – Order Manager
-// Wraps Zerodha Kite Connect REST API for order operations.
+// Wraps Zerodha Kite Connect REST API for order operations and
+// delegates to VirtualOrderManager when Virtual Mode is active.
 // ============================================================
 import { KiteConnect } from 'kiteconnect';
-import type { PlaceOrderParams, OrderResponse } from '../types';
+import { getKiteInstance } from '../auth/authServer';
+import { getAccessToken } from '../auth/sessionManager';
+import { riskManager } from '../risk/riskManager';
+import { virtualOrderManager } from './virtualOrderManager';
+import { gttManager } from './gttManager';
+import type { PlaceOrderParams, OrderResponse, TradeDetails, TradingSignal } from '../types';
 
 /** Result type for order placement. */
 export interface PlaceOrderResult {
@@ -25,6 +31,9 @@ export interface OrderDetails {
   exchange: string;
   filled_quantity: number;
   average_price: number;
+  status_message?: string;
+  order_timestamp?: string;
+  validity?: string;
 }
 
 /** Position details from Kite. */
@@ -38,6 +47,9 @@ export interface Position {
   unrealised: number;
   realised: number;
   pnl: number;
+  m2m?: number;
+  buy_quantity?: number;
+  sell_quantity?: number;
 }
 
 /** Margin result from Kite. */
@@ -63,7 +75,13 @@ class OrderManager {
   }
 
   private ensureKite(): KiteConnect {
-    if (!this.kite) throw new Error('[OrderManager] KiteConnect instance not set.');
+    if (!this.kite) {
+      this.kite = getKiteInstance();
+    }
+    const token = getAccessToken();
+    if (token && this.kite.access_token !== token) {
+      this.kite.setAccessToken(token);
+    }
     return this.kite;
   }
 
@@ -78,10 +96,14 @@ class OrderManager {
   }
 
   /**
-   * Place a single order via Kite Connect.
-   * Handles rate limiting and returns a structured result.
+   * Place an order. In Virtual Mode, simulates fill and attaches virtual SL/Target.
+   * In Live Mode, executes via Kite Connect and attaches GTT OCO order.
    */
-  async placeOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
+  async placeOrder(params: PlaceOrderParams, signal?: TradingSignal): Promise<PlaceOrderResult> {
+    if (riskManager.isVirtualTrading()) {
+      return virtualOrderManager.placeOrder(params, signal);
+    }
+
     const kite = this.ensureKite();
     await this.rateLimit();
 
@@ -102,25 +124,146 @@ class OrderManager {
         trigger_price: params.trigger_price ?? 0,
       }) as OrderResponse;
 
-      console.log(`[OrderManager] Order placed: ${response.order_id}`);
+      console.log(`[OrderManager] Live Order placed: ${response.order_id}`);
+
+      // If Target and Stop Loss are specified, automatically place GTT OCO order
+      if (signal?.targetPrice && signal?.stopLossPrice) {
+        try {
+          const exitAction = params.transaction_type === 'BUY' ? 'SELL' : 'BUY';
+          const triggerValues = [signal.stopLossPrice, signal.targetPrice].sort((a, b) => a - b);
+          await gttManager.placeGTT({
+            type: 'two-leg',
+            condition: {
+              exchange: params.exchange,
+              tradingsymbol: params.tradingsymbol,
+              trigger_values: triggerValues,
+              last_price: signal.currentPrice,
+            },
+            orders: [
+              {
+                exchange: params.exchange,
+                tradingsymbol: params.tradingsymbol,
+                transaction_type: exitAction,
+                quantity: params.quantity,
+                order_type: 'LIMIT',
+                product: params.product as 'CNC' | 'MIS' | 'NRML',
+                price: signal.stopLossPrice,
+              },
+              {
+                exchange: params.exchange,
+                tradingsymbol: params.tradingsymbol,
+                transaction_type: exitAction,
+                quantity: params.quantity,
+                order_type: 'LIMIT',
+                product: params.product as 'CNC' | 'MIS' | 'NRML',
+                price: signal.targetPrice,
+              },
+            ],
+          });
+          console.log(`[OrderManager] Attached GTT OCO for ${params.tradingsymbol}: SL ₹${signal.stopLossPrice}, Target ₹${signal.targetPrice}`);
+        } catch (gttErr) {
+          console.warn('[OrderManager] Could not attach GTT OCO order:', gttErr);
+        }
+      }
+
       return { success: true, orderId: response.order_id };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error('[OrderManager] Order placement failed:', message);
+      console.error('[OrderManager] Live Order placement failed:', message);
       return { success: false, error: message };
     }
   }
 
   /**
-   * Fetch all orders for the current session.
+   * Modify an open or pending order.
+   */
+  async modifyOrder(
+    variety: string = 'regular',
+    orderId: string,
+    params: {
+      quantity?: number;
+      price?: number;
+      order_type?: string;
+      trigger_price?: number;
+      validity?: string;
+    },
+  ): Promise<boolean> {
+    const kite = this.ensureKite();
+    await this.rateLimit();
+
+    try {
+      await kite.modifyOrder(variety as 'regular', orderId, params);
+      console.log(`[OrderManager] Modified order: ${orderId}`);
+      return true;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[OrderManager] Order modification failed for ${orderId}:`, message);
+      return false;
+    }
+  }
+
+  /**
+   * Fetch today's order book. In Virtual Mode, returns virtual paper orders if available.
    */
   async getOrders(): Promise<OrderDetails[]> {
+    if (riskManager.isVirtualTrading()) {
+      const vOrders = virtualOrderManager.getOrders();
+      if (vOrders.length > 0) {
+        return vOrders.map((vo) => ({
+          order_id: vo.order_id,
+          tradingsymbol: vo.tradingsymbol,
+          transaction_type: vo.transaction_type,
+          quantity: vo.quantity,
+          price: vo.price,
+          status: vo.status,
+          order_type: vo.order_type,
+          product: vo.product,
+          exchange: vo.exchange,
+          filled_quantity: vo.quantity,
+          average_price: vo.price,
+          status_message: vo.status_message,
+          order_timestamp: vo.order_timestamp,
+        }));
+      }
+    }
+
     const kite = this.ensureKite();
     try {
       const orders = await kite.getOrders();
       return (orders as unknown as OrderDetails[]) ?? [];
     } catch (err: unknown) {
-      console.error('[OrderManager] Failed to fetch orders:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[OrderManager] Failed to fetch orders:', message);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch executed trades for the day.
+   */
+  async getTrades(): Promise<TradeDetails[]> {
+    const kite = this.ensureKite();
+    try {
+      const trades = await kite.getTrades();
+      return (trades as unknown as TradeDetails[]) ?? [];
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[OrderManager] Failed to fetch trades:', message);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch trades executed for a specific order.
+   */
+  async getOrderTrades(orderId: string): Promise<TradeDetails[]> {
+    const kite = this.ensureKite();
+    try {
+      const trades = await kite.getOrderTrades(orderId);
+      return (trades as unknown as TradeDetails[]) ?? [];
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[OrderManager] Failed to fetch trades for order ${orderId}:`, message);
       return [];
     }
   }
@@ -137,7 +280,8 @@ class OrderManager {
         day: (positions.day as unknown as Position[]) ?? [],
       };
     } catch (err: unknown) {
-      console.error('[OrderManager] Failed to fetch positions:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[OrderManager] Failed to fetch positions:', message);
       return { net: [], day: [] };
     }
   }
@@ -158,11 +302,8 @@ class OrderManager {
 
   /**
    * Estimate margin required for a proposed order.
-   * Returns estimated value based on current price * qty as a fallback.
    */
   async estimateMargin(price: number, qty: number): Promise<number> {
-    // A simple estimation: for MIS intraday margin is typically ~20% of order value.
-    // Actual Kite margin APIs require basket margin endpoint.
     return price * qty * 0.2;
   }
 
@@ -199,14 +340,15 @@ class OrderManager {
    * Format a position summary for Telegram display.
    */
   formatPositionSummary(positions: Position[]): string {
-    if (positions.length === 0) return '_No open positions_';
+    if (positions.length === 0) return '<i>No open positions</i>';
 
     return positions.map((p) => {
-      const pnlEmoji = (p.unrealised + p.realised) >= 0 ? '🟢' : '🔴';
+      const pnl = (p.unrealised ?? 0) + (p.realised ?? 0);
+      const pnlEmoji = pnl >= 0 ? '🟢' : '🔴';
       return (
-        `${pnlEmoji} *${p.tradingsymbol}*\n` +
-        `  Qty: ${p.quantity} | Avg: ₹${p.average_price.toFixed(2)} | LTP: ₹${p.last_price.toFixed(2)}\n` +
-        `  P&L: ₹${(p.unrealised + p.realised).toFixed(2)}`
+        `${pnlEmoji} <b>${p.tradingsymbol}</b> (${p.product})\n` +
+        `  Qty: <code>${p.quantity}</code> | Avg: ₹${p.average_price.toFixed(2)} | LTP: ₹${p.last_price.toFixed(2)}\n` +
+        `  P&amp;L: <b>₹${pnl.toFixed(2)}</b>`
       );
     }).join('\n\n');
   }

@@ -14,9 +14,14 @@ import { candleAggregator } from './engine/candleAggregator';
 import { indicatorEngine } from './engine/indicatorEngine';
 import { riskManager } from './risk/riskManager';
 import { orderManager } from './orders/orderManager';
+import { userManager } from './user/userManager';
+import { portfolioManager } from './portfolio/portfolioManager';
+import { marketDataManager } from './market/marketDataManager';
+import { gttManager } from './orders/gttManager';
+import { virtualOrderManager } from './orders/virtualOrderManager';
 import { telegramBot } from './bot/bot';
 import { readConfig } from './storage/storage';
-import type { StrategiesConfig, Rule, PriceRangeRule, MACrossRule, IndexOptionRule, TradingSignal, Timeframe } from './types';
+import type { StrategiesConfig, Rule, PriceRangeRule, MACrossRule, IndexOptionRule, CompositeRule, TradingSignal, Timeframe } from './types';
 
 // Map of instrument_token => list of rules that watch it
 const tokenToRules: Map<number, Rule[]> = new Map();
@@ -46,14 +51,15 @@ async function syncStrategySubscriptions(): Promise<void> {
 
     let token: number | null = null;
 
-    if (rule.type === 'PRICE_RANGE' || rule.type === 'MA_CROSS') {
-      const typedRule = rule as PriceRangeRule | MACrossRule;
+    if (rule.type === 'PRICE_RANGE' || rule.type === 'MA_CROSS' || rule.type === 'COMPOSITE') {
+      const typedRule = rule as PriceRangeRule | MACrossRule | CompositeRule;
       const instrument = instrumentManager.findBySymbol(typedRule.symbol, typedRule.exchange);
       if (!instrument) {
         console.warn(`[Index] Instrument not found for rule ${rule.id}: ${typedRule.symbol}`);
         continue;
       }
       token = instrument.instrument_token;
+      virtualOrderManager.registerTokenSymbol(token, typedRule.symbol);
     } else if (rule.type === 'INDEX_OPTION') {
       const typedRule = rule as IndexOptionRule;
       // For INDEX_OPTION, subscribe to the underlying index spot
@@ -98,8 +104,8 @@ async function dispatchSignal(ruleId: string, rule: Rule, price: number, token: 
   let tradingsymbol = '';
   let exchange = 'NSE';
 
-  if (rule.type === 'PRICE_RANGE' || rule.type === 'MA_CROSS') {
-    const typedRule = rule as PriceRangeRule | MACrossRule;
+  if (rule.type === 'PRICE_RANGE' || rule.type === 'MA_CROSS' || rule.type === 'COMPOSITE') {
+    const typedRule = rule as PriceRangeRule | MACrossRule | CompositeRule;
     tradingsymbol = typedRule.symbol;
     exchange = typedRule.exchange;
   } else if (rule.type === 'INDEX_OPTION') {
@@ -114,7 +120,7 @@ async function dispatchSignal(ruleId: string, rule: Rule, price: number, token: 
 
     if (!contract) {
       await telegramBot.notify(
-        `⚠️ *Signal Blocked*\n\nRule #${rule.id}: Could not resolve option contract for ${typedRule.underlying} ${typedRule.strikeOffset} ${typedRule.optionType}`,
+        `⚠️ <b>Signal Blocked</b>\n\nRule #${rule.id}: Could not resolve option contract for ${typedRule.underlying} ${typedRule.strikeOffset} ${typedRule.optionType}`,
       );
       return;
     }
@@ -127,10 +133,26 @@ async function dispatchSignal(ruleId: string, rule: Rule, price: number, token: 
 
   const estimatedMargin = await orderManager.estimateMargin(price, rule.qty);
 
+  // Compute Target and Stop Loss levels (default: 2% SL, 5% Target)
+  const stopLossPct = rule.stop_loss_pct ?? 2.0;
+  const targetPct = rule.target_pct ?? 5.0;
+  const isBuy = rule.action === 'BUY';
+  const targetPrice = isBuy
+    ? Number((price * (1 + targetPct / 100)).toFixed(2))
+    : Number((price * (1 - targetPct / 100)).toFixed(2));
+  const stopLossPrice = isBuy
+    ? Number((price * (1 - stopLossPct / 100)).toFixed(2))
+    : Number((price * (1 + stopLossPct / 100)).toFixed(2));
+
+  const ruleName =
+    rule.type === 'COMPOSITE'
+      ? `EMA ${(rule as CompositeRule).fastEMA}/${(rule as CompositeRule).slowEMA} + RSI + Vol`
+      : `${rule.type} Rule`;
+
   const signal: TradingSignal = {
     id: `${ruleId}_${Date.now()}`,
     ruleId,
-    ruleName: `${rule.type} Rule`,
+    ruleName,
     tradingsymbol,
     exchange: exchange as TradingSignal['exchange'],
     action: rule.action,
@@ -141,13 +163,17 @@ async function dispatchSignal(ruleId: string, rule: Rule, price: number, token: 
     estimatedMargin,
     timestamp: new Date(),
     instrumentToken: token,
+    stopLossPct,
+    targetPct,
+    stopLossPrice,
+    targetPrice,
   };
 
   // Risk check
   const riskCheck = await riskManager.checkSignal(signal);
   if (!riskCheck.allowed) {
     await telegramBot.notify(
-      `🚫 *Signal Blocked by Risk Manager*\n\n` +
+      `🚫 <b>Signal Blocked by Risk Manager</b>\n\n` +
       `Rule: #${ruleId} — ${tradingsymbol}\n` +
       `Reason: ${riskCheck.reason}`,
     );
@@ -184,7 +210,7 @@ function setupCronJobs(): void {
     if (!isAuthenticated()) {
       const loginUrl = `http://localhost:${config.port}/login`;
       await telegramBot.notify(
-        `🔐 *Daily Login Reminder*\n\n` +
+        `🔐 <b>Daily Login Reminder</b>\n\n` +
         `Your Zerodha access token needs to be renewed.\n\n` +
         `Login URL: ${loginUrl}`,
       );
@@ -203,7 +229,12 @@ function setupCronJobs(): void {
  * Wire up the engine: ticks → candles → indicators → signals.
  */
 function setupEngineCallbacks(): void {
-  // Route incoming ticks to candle aggregator and price-range evaluator
+  // Wire Virtual Order exit alerts to Telegram
+  virtualOrderManager.setExitCallback(async (_pos, msg) => {
+    await telegramBot.notify(msg);
+  });
+
+  // Route incoming ticks to candle aggregator, price evaluator, and virtual exit tracker
   tickerClient.onTick((ticks) => {
     for (const tick of ticks) {
       // Update indicator engine prices
@@ -211,6 +242,9 @@ function setupEngineCallbacks(): void {
 
       // Evaluate PRICE_RANGE rules on tick
       indicatorEngine.evaluatePriceRulesOnTick(tick, tokenToRules);
+
+      // Check Virtual Positions for automated Target / Stop Loss hits
+      void virtualOrderManager.checkExits(tick);
     }
 
     // Aggregate all ticks into candles
@@ -255,10 +289,14 @@ function setupEngineCallbacks(): void {
 async function initializeSubsystems(accessToken: string): Promise<void> {
   const kite = getKiteInstance();
 
-  // Wire kite instance into subsystems
+  // Wire kite instance into all subsystems
   riskManager.setKite(kite);
   orderManager.setKite(kite);
   instrumentManager.setKite(kite);
+  userManager.setKite(kite);
+  portfolioManager.setKite(kite);
+  marketDataManager.setKite(kite);
+  gttManager.setKite(kite);
 
   // Fetch instruments and sync subscriptions
   try {
@@ -270,12 +308,16 @@ async function initializeSubsystems(accessToken: string): Promise<void> {
   }
 
   // Initialize and connect KiteTicker
-  tickerClient.setTelegramAlertFn((msg) => telegramBot.notify(msg));
-  tickerClient.initialize(config.kiteApiKey, accessToken);
-  tickerClient.connect();
+  try {
+    tickerClient.setTelegramAlertFn((msg) => telegramBot.notify(msg));
+    tickerClient.initialize(config.kiteApiKey, accessToken);
+    tickerClient.connect();
+  } catch (tickerErr) {
+    console.warn('[Index] Ticker connect warning (markets may be closed):', tickerErr);
+  }
 
   console.log('[Index] All subsystems initialized.');
-  await telegramBot.notify('✅ *Trade Master Online*\n\nSubsystems initialized and WebSocket connected.');
+  await telegramBot.notify('✅ <b>Trade Master Online</b>\n\nSubsystems initialized and ready.');
 }
 
 /**
@@ -308,7 +350,7 @@ async function main(): Promise<void> {
   } else {
     console.log('[Index] No valid session. Please authenticate via Telegram /login or browser.');
     await telegramBot.notify(
-      '⚠️ *Trade Master Started — Authentication Required*\n\n' +
+      '⚠️ <b>Trade Master Started — Authentication Required</b>\n\n' +
       `Please login at: http://localhost:${config.port}/login\n\n` +
       'The engine will activate automatically after authentication.',
     );

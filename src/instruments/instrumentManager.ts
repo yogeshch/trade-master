@@ -3,6 +3,8 @@
 // Fetches, caches, and looks up Zerodha instrument master data.
 // ============================================================
 import { KiteConnect } from 'kiteconnect';
+import { getKiteInstance } from '../auth/authServer';
+import { getAccessToken } from '../auth/sessionManager';
 import type { Instrument, Exchange, Underlying, ExpiryType, OptionType, StrikeOffset } from '../types';
 
 // Strike step sizes per index
@@ -29,14 +31,25 @@ class InstrumentManager {
     this.kite = kite;
   }
 
+  private ensureKite(): KiteConnect {
+    if (!this.kite) {
+      this.kite = getKiteInstance();
+    }
+    const token = getAccessToken();
+    if (token && this.kite.access_token !== token) {
+      this.kite.setAccessToken(token);
+    }
+    return this.kite;
+  }
+
   /**
    * Fetch and cache the full instrument master from Zerodha.
    */
   async fetchInstruments(): Promise<void> {
-    if (!this.kite) throw new Error('[InstrumentManager] KiteConnect instance not set.');
+    const kite = this.ensureKite();
 
     console.log('[InstrumentManager] Fetching instrument master...');
-    const raw = await this.kite.getInstruments();
+    const raw = await kite.getInstruments();
     this.instruments = raw as unknown as Instrument[];
     this.lastFetchTime = new Date();
     console.log(`[InstrumentManager] Loaded ${this.instruments.length} instruments.`);
